@@ -168,11 +168,21 @@ export function generateSSEDone(): string {
  */
 export function buildModelsList(): OpenAIModelsResponse {
   const models: OpenAIModel[] = [
+    { id: 'claude-haiku-4.5', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'claude-opus-4.8', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'claude-sonnet-5', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'deepseek-v4-flash', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'deepseek-v4-pro', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'gpt-5.5', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'gpt-5.4-mini', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'gemini-3.1-flash-lite', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'grok-4.3', object: 'model', created: 1700000000, owned_by: 'questflow' },
     { id: 'kimi-k2.7-code', object: 'model', created: 1700000000, owned_by: 'questflow' },
-    { id: 'tars-default', object: 'model', created: 1700000000, owned_by: 'questflow' },
-    { id: 'tars-gpt-4o', object: 'model', created: 1700000000, owned_by: 'questflow' },
-    { id: 'tars-gpt-4o-mini', object: 'model', created: 1700000000, owned_by: 'questflow' },
-    { id: 'tars-claude-sonnet', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'minimax-m3', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'qwen-3.7-max', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'xiaomi-mimo-v2.5', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'xiaomi-mimo-v2.5-pro', object: 'model', created: 1700000000, owned_by: 'questflow' },
+    { id: 'z.ai-glm-5.2', object: 'model', created: 1700000000, owned_by: 'questflow' },
   ];
 
   return {
