@@ -1,5 +1,6 @@
 import { Request, Response, Router } from 'express';
 import fetch from 'node-fetch';
+import http from 'http';
 import https from 'https';
 import { v4 as uuidv4 } from 'uuid';
 import { OpenAIChatRequest } from '../types/openai';
@@ -15,43 +16,39 @@ import { logger } from '../utils/logger';
 
 const router = Router();
 
-// HTTP Agent for connection reuse
-const httpsAgent = new https.Agent({
-  keepAlive: true,
-  keepAliveMsecs: 30000,
-  timeout: 30000,
-});
+// 长时间 Keep-Alive Agent，避免 Termux 上的 Premature close
+const httpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 60000, timeout: 60000 });
+const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, timeout: 60000 });
 
-// 会话缓存：OpenAI conversation_id -> Questflow conversationId + companyId
 const conversationCache = new Map<string, { questflowId: string; companyId: string }>();
 
-/**
- * fetch 带重试逻辑，处理 Termux/移动端网络抖动
- */
-async function fetchWithRetry(url: string, options: any, retries = 3): Promise<any> {
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const res = await fetch(url, { ...options, agent: options.agent || httpsAgent });
-      return res;
-    } catch (err: any) {
-      const msg = err.message || '';
-      const isRetryable = err.type === 'system'
-        || msg.includes('Premature close')
-        || msg.includes('ECONNRESET')
-        || msg.includes('ETIMEDOUT')
-        || msg.includes('socket hang up')
-        || err.code === 'ECONNRESET'
-        || err.code === 'ETIMEDOUT';
+function fetchWithRetry(url: string, options: any, retries = 3): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const attempt = (n: number) => {
+      const opts = { ...options, agent: url.startsWith('https') ? httpsAgent : httpAgent };
+      fetch(url, opts)
+        .then(resolve)
+        .catch((err: any) => {
+          const msg = err.message || '';
+          const isRetryable =
+            err.type === 'system' ||
+            msg.includes('Premature close') ||
+            msg.includes('ECONNRESET') ||
+            msg.includes('ETIMEDOUT') ||
+            msg.includes('socket hang up') ||
+            msg.includes('network timeout');
 
-      if (i < retries && isRetryable) {
-        const delay = 1000 * (i + 1);
-        logger.warn(`Fetch retry ${i + 1}/${retries} after ${delay}ms: ${msg}`);
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
-      throw err;
-    }
-  }
+          if (n < retries && isRetryable) {
+            const delay = 1000 * (n + 1);
+            logger.warn(`Fetch retry ${n + 1}/${retries} after ${delay}ms: ${msg}`);
+            setTimeout(() => attempt(n + 1), delay);
+          } else {
+            reject(err);
+          }
+        });
+    };
+    attempt(0);
+  });
 }
 
 function getQuestflowHeaders(): Record<string, string> {
@@ -66,133 +63,77 @@ function getQuestflowHeaders(): Record<string, string> {
   };
 
   switch (authType) {
-    case 'cookie':
-      headers['Cookie'] = token;
-      break;
-    case 'bearer':
-      headers['Authorization'] = `Bearer ${token}`;
-      break;
-    case 'apikey':
-      headers['X-API-Key'] = token;
-      break;
+    case 'cookie': headers['Cookie'] = token; break;
+    case 'bearer': headers['Authorization'] = `Bearer ${token}`; break;
+    case 'apikey': headers['X-API-Key'] = token; break;
     case 'custom':
-      const customHeader = process.env.QUESTFLOW_CUSTOM_HEADER || 'X-Custom-Auth';
-      headers[customHeader] = token;
+      const h = process.env.QUESTFLOW_CUSTOM_HEADER || 'X-Custom-Auth';
+      headers[h] = token;
       break;
   }
-
   return headers;
-}
-
-async function getCompanyId(cookie: string): Promise<string> {
-  if (process.env.QUESTFLOW_COMPANY_ID) return process.env.QUESTFLOW_COMPANY_ID;
-  try {
-    const baseUrl = process.env.QUESTFLOW_BASE_URL || 'https://next.questflow.ai';
-    const res = await fetchWithRetry(`${baseUrl}/api/v6/copilot/conversations`, {
-      headers: { 'Cookie': cookie, 'User-Agent': 'Mozilla/5.0' },
-    });
-    const data: any = await res.json();
-    return data.data?.[0]?.companyId || '';
-  } catch {
-    return '';
-  }
 }
 
 async function createConversation(cookie: string): Promise<{ questflowId: string; companyId: string }> {
   const baseUrl = process.env.QUESTFLOW_BASE_URL || 'https://next.questflow.ai';
-  try {
-    const res = await fetchWithRetry(`${baseUrl}/api/v6/copilot/conversations`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Cookie': cookie,
-        'Origin': 'https://next.questflow.ai',
-        'Referer': 'https://next.questflow.ai/',
-        'User-Agent': 'Mozilla/5.0',
-      },
-      body: JSON.stringify({ title: 'API Chat' }),
-    });
-
-    if (res.ok) {
-      let text = '';
-      try { text = await res.text(); } catch { /* body already consumed */ }
-      if (text) {
-        const data = JSON.parse(text);
-        const questflowId = data.data?._id || data._id;
-        const companyId = data.data?.companyId || process.env.QUESTFLOW_COMPANY_ID || '';
-        if (questflowId) return { questflowId, companyId };
-      }
-    }
-    throw new Error(`Create conversation returned ${res.status}`);
-  } catch (err: any) {
-    logger.warn('Failed to create conversation, falling back to existing:', err.message);
-    throw err;
-  }
+  const res = await fetchWithRetry(`${baseUrl}/api/v6/copilot/conversations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie, Origin: 'https://next.questflow.ai', Referer: 'https://next.questflow.ai/', 'User-Agent': 'Mozilla/5.0' },
+    body: JSON.stringify({ title: 'API Chat' }),
+  });
+  if (!res.ok) throw new Error(`Cannot create conversation: ${res.status}`);
+  const data: any = await res.json();
+  const id = data.data?._id || data._id;
+  const cid = data.data?.companyId || process.env.QUESTFLOW_COMPANY_ID || '';
+  if (!id) throw new Error('No conversation ID');
+  return { questflowId: id, companyId: cid };
 }
 
 async function getExistingConversation(cookie: string): Promise<{ questflowId: string; companyId: string } | null> {
   try {
     const baseUrl = process.env.QUESTFLOW_BASE_URL || 'https://next.questflow.ai';
     const res = await fetchWithRetry(`${baseUrl}/api/v6/copilot/conversations`, {
-      headers: { 'Cookie': cookie, 'User-Agent': 'Mozilla/5.0' },
+      headers: { Cookie: cookie, 'User-Agent': 'Mozilla/5.0' },
     });
-    const text = await res.text();
-    if (!text) return null;
-    const data = JSON.parse(text);
+    const data: any = await res.json();
     if (data.data?.length > 0) {
-      return {
-        questflowId: data.data[0]._id,
-        companyId: data.data[0].companyId || process.env.QUESTFLOW_COMPANY_ID || '',
-      };
+      return { questflowId: data.data[0]._id, companyId: data.data[0].companyId || process.env.QUESTFLOW_COMPANY_ID || '' };
     }
-    return null;
-  } catch {
-    return null;
-  }
+  } catch {}
+  return null;
 }
 
 async function getOrCreateConversation(
-  conversationId: string | undefined,
-  cookie: string
+  conversationId: string | undefined, cookie: string
 ): Promise<{ questflowId: string; companyId: string }> {
   if (conversationId && conversationCache.has(conversationId)) {
     return conversationCache.get(conversationId)!;
   }
-
-  // 尝试创建新对话
   try {
     const conv = await createConversation(cookie);
     const key = conversationId || `qf-${uuidv4()}`;
     conversationCache.set(key, conv);
     return conv;
-  } catch {
-    // 创建失败，尝试复用已有对话
+  } catch (err) {
+    logger.warn('Create conversation failed, trying existing');
     const existing = await getExistingConversation(cookie);
     if (existing) {
-      logger.info('Using existing conversation:', existing.questflowId);
+      logger.info('Reusing conversation:', existing.questflowId);
       const key = conversationId || `qf-${uuidv4()}`;
       conversationCache.set(key, existing);
       return existing;
     }
-    // 最后兜底：用 env 中的 companyId
-    const companyId = await getCompanyId(cookie);
-    throw new Error('Cannot create or find any conversation. Please ensure cookies are valid.');
+    throw new Error('Cannot create or find conversation. Check cookies.');
   }
 }
 
 function buildQuestflowBody(
-  request: OpenAIChatRequest,
-  conversationId: string,
-  companyId: string
+  request: OpenAIChatRequest, conversationId: string, companyId: string
 ): Record<string, unknown> {
-  const model = request.model || process.env.QUESTFLOW_DEFAULT_MODEL || 'kimi-k2.7-code';
-
   return {
-    conversationId,
-    companyId,
-    id: conversationId,
+    conversationId, companyId, id: conversationId,
     messages: convertToQuestflowMessages(request.messages),
-    model,
+    model: request.model || process.env.QUESTFLOW_DEFAULT_MODEL || 'kimi-k2.7-code',
     trigger: 'submit-message',
   };
 }
@@ -211,21 +152,16 @@ router.post('/completions', async (req: Request, res: Response) => {
 
     const headers = getQuestflowHeaders();
     const cookie = headers['Cookie'] || process.env.QUESTFLOW_AUTH_TOKEN || '';
-
-    // 获取或创建 Questflow 会话
     const conv = await getOrCreateConversation(request.conversation_id, cookie);
-
     const body = buildQuestflowBody(request, conv.questflowId, conv.companyId);
 
-    logger.debug('Forwarding to Questflow:', { url, body: JSON.stringify(body).substring(0, 200) });
+    logger.debug('Forwarding to Questflow:', { url });
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), parseInt(process.env.REQUEST_TIMEOUT || '60000'));
 
     const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
+      method: 'POST', headers, body: JSON.stringify(body),
       signal: controller.signal as any,
       agent: httpsAgent,
     });
@@ -235,21 +171,13 @@ router.post('/completions', async (req: Request, res: Response) => {
     if (!response.ok) {
       const errorText = await response.text();
       logger.error('Questflow API error:', response.status, errorText);
-
       if (response.status === 402) {
-        let errorMsg = 'Questflow account has insufficient balance.';
-        try {
-          const errJson = JSON.parse(errorText);
-          if (errJson.message) errorMsg = errJson.message;
-        } catch { /* ignore */ }
-        res.status(402).json(buildErrorResponse(errorMsg, 'insufficient_balance'));
+        let msg = 'Insufficient balance';
+        try { const j = JSON.parse(errorText); if (j.message) msg = j.message; } catch {}
+        res.status(402).json(buildErrorResponse(msg, 'insufficient_balance'));
         return;
       }
-
-      res.status(response.status).json(buildErrorResponse(
-        `Questflow API returned ${response.status}: ${errorText}`,
-        'upstream_error'
-      ));
+      res.status(response.status).json(buildErrorResponse(`Questflow API error ${response.status}`, 'upstream_error'));
       return;
     }
 
@@ -261,123 +189,76 @@ router.post('/completions', async (req: Request, res: Response) => {
 
       const reader = response.body;
       if (!reader) {
-        res.status(500).json(buildErrorResponse('No response body from upstream', 'upstream_error'));
+        res.status(500).json(buildErrorResponse('No response body', 'upstream_error'));
         return;
       }
 
-      let buffer = '';
-      let messageId = '';
+      let buffer = '', messageId = '';
       const decoder = new TextDecoder();
 
       reader.on('data', (chunk: Buffer) => {
-        try {
-          buffer += decoder.decode(chunk, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith(':')) continue;
-
-            let dataStr = trimmed;
-            if (trimmed.startsWith('data: ')) {
-              dataStr = trimmed.slice(6);
-            } else if (trimmed.startsWith('data:')) {
-              dataStr = trimmed.slice(5);
-            }
-
-            if (dataStr === '[DONE]') {
-              res.write(generateSSEDone());
-              continue;
-            }
-
-            try {
-              const questflowChunk: any = JSON.parse(dataStr);
-              if (questflowChunk.type === 'start' && questflowChunk.messageId) {
-                messageId = questflowChunk.messageId;
-              }
-              const openaiChunk = convertToOpenAIStreamChunk(questflowChunk, model, 0, messageId);
-              if (openaiChunk) {
-                res.write(generateSSELine(openaiChunk));
-              }
-            } catch {
-              // 非 JSON 行，忽略
-            }
-          }
-        } catch (err) {
-          logger.error('Stream processing error:', err);
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith(':')) continue;
+          let ds = trimmed;
+          if (ds.startsWith('data: ')) ds = ds.slice(6);
+          else if (ds.startsWith('data:')) ds = ds.slice(5);
+          else continue;
+          if (ds === '[DONE]') { res.write(generateSSEDone()); continue; }
+          try {
+            const evt: any = JSON.parse(ds);
+            if (evt.type === 'start' && evt.messageId) messageId = evt.messageId;
+            const chunk = convertToOpenAIStreamChunk(evt, model, 0, messageId);
+            if (chunk) res.write(generateSSELine(chunk));
+          } catch {}
         }
       });
 
-      reader.on('end', () => {
-        res.write(generateSSEDone());
-        res.end();
-      });
-
-      reader.on('error', (err: Error) => {
-        logger.error('Stream error:', err);
-        res.end();
-      });
-
+      reader.on('end', () => { res.write(generateSSEDone()); res.end(); });
+      reader.on('error', (err: Error) => { logger.error('Stream error:', err); if (!res.writableEnded) res.end(); });
       return;
     }
 
-    // 非流式：Questflow 只返回 SSE 流，需要收集后合并
-    const reader2 = response.body;
-    if (!reader2) {
+    // 非流式
+    const reader = response.body;
+    if (!reader) {
       res.status(500).json(buildErrorResponse('No response body', 'upstream_error'));
       return;
     }
 
-    let fullText = '';
-    let buffer2 = '';
-    const decoder2 = new TextDecoder();
+    let fullText = '', buffer = '';
+    const decoder = new TextDecoder();
 
     await new Promise<void>((resolve, reject) => {
-      reader2.on('data', (chunk: Buffer) => {
-        buffer2 += decoder2.decode(chunk, { stream: true });
-        const lines = buffer2.split('\n');
-        buffer2 = lines.pop() || '';
-
+      reader.on('data', (chunk: Buffer) => {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith(':') || trimmed === 'data: [DONE]') continue;
-
-          let dataStr = trimmed;
-          if (trimmed.startsWith('data: ')) {
-            dataStr = trimmed.slice(6);
-          } else if (trimmed.startsWith('data:')) {
-            dataStr = trimmed.slice(5);
-          }
-
-          try {
-            const chunk = JSON.parse(dataStr);
-            if (chunk.type === 'text-delta') {
-              fullText += chunk.delta || '';
-            }
-          } catch { /* skip */ }
+          const t = line.trim();
+          if (!t || t.startsWith(':') || t === 'data: [DONE]') continue;
+          let ds = t;
+          if (ds.startsWith('data: ')) ds = ds.slice(6);
+          else if (ds.startsWith('data:')) ds = ds.slice(5);
+          else continue;
+          try { const evt = JSON.parse(ds); if (evt.type === 'text-delta') fullText += evt.delta || ''; } catch {}
         }
       });
-
-      reader2.on('end', resolve);
-      reader2.on('error', reject);
+      reader.on('end', resolve);
+      reader.on('error', reject);
     });
 
-    const openaiResponse = convertToOpenAIResponse(
-      { id: `qf-${Date.now()}`, text: fullText } as any,
-      model,
-      request.messages
-    );
-    res.json(openaiResponse);
+    res.json(convertToOpenAIResponse({ id: `qf-${Date.now()}`, text: fullText } as any, model, request.messages));
 
   } catch (err: any) {
     logger.error('Chat completion error:', err.message);
-
     if (err.name === 'AbortError') {
       res.status(504).json(buildErrorResponse('Request timeout', 'timeout_error'));
       return;
     }
-
     res.status(500).json(buildErrorResponse(err.message || 'Internal server error'));
   }
 });
