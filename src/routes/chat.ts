@@ -26,18 +26,27 @@ const httpsAgent = new https.Agent({
 const conversationCache = new Map<string, { questflowId: string; companyId: string }>();
 
 /**
- * fetch 带重试逻辑，处理 Premature close 等网络抖动
+ * fetch 带重试逻辑，处理 Termux/移动端网络抖动
  */
-async function fetchWithRetry(url: string, options: any, retries = 2): Promise<any> {
+async function fetchWithRetry(url: string, options: any, retries = 3): Promise<any> {
   for (let i = 0; i <= retries; i++) {
     try {
-      const res = await fetch(url, { ...options, agent: httpsAgent });
+      const res = await fetch(url, { ...options, agent: options.agent || httpsAgent });
       return res;
     } catch (err: any) {
-      if (i === retries) throw err;
-      if (err.type === 'system' || err.message?.includes('Premature close')) {
-        logger.warn(`Fetch retry ${i + 1}/${retries}: ${url} - ${err.message}`);
-        await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+      const msg = err.message || '';
+      const isRetryable = err.type === 'system'
+        || msg.includes('Premature close')
+        || msg.includes('ECONNRESET')
+        || msg.includes('ETIMEDOUT')
+        || msg.includes('socket hang up')
+        || err.code === 'ECONNRESET'
+        || err.code === 'ETIMEDOUT';
+
+      if (i < retries && isRetryable) {
+        const delay = 1000 * (i + 1);
+        logger.warn(`Fetch retry ${i + 1}/${retries} after ${delay}ms: ${msg}`);
+        await new Promise(r => setTimeout(r, delay));
         continue;
       }
       throw err;
@@ -75,58 +84,100 @@ function getQuestflowHeaders(): Record<string, string> {
   return headers;
 }
 
-async function createConversation(cookie: string): Promise<{ questflowId: string; companyId: string }> {
-  const baseUrl = process.env.QUESTFLOW_BASE_URL || 'https://next.questflow.ai';
-  const res = await fetchWithRetry(`${baseUrl}/api/v6/copilot/conversations`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Cookie': cookie,
-      'Origin': 'https://next.questflow.ai',
-      'Referer': 'https://next.questflow.ai/',
-      'User-Agent': 'Mozilla/5.0',
-    },
-    body: JSON.stringify({ title: 'API Chat' }),
-  });
-
-  if (!res.ok) {
-    throw new Error(`Failed to create conversation: ${res.status}`);
-  }
-
-  const data: any = await res.json();
-  const questflowId = data.data?._id || data._id;
-  const companyId = data.data?.companyId || process.env.QUESTFLOW_COMPANY_ID || '';
-
-  if (!companyId) {
-    const detailRes = await fetchWithRetry(`${baseUrl}/api/v6/copilot/conversations`, {
+async function getCompanyId(cookie: string): Promise<string> {
+  if (process.env.QUESTFLOW_COMPANY_ID) return process.env.QUESTFLOW_COMPANY_ID;
+  try {
+    const baseUrl = process.env.QUESTFLOW_BASE_URL || 'https://next.questflow.ai';
+    const res = await fetchWithRetry(`${baseUrl}/api/v6/copilot/conversations`, {
       headers: { 'Cookie': cookie, 'User-Agent': 'Mozilla/5.0' },
     });
-    const listData: any = await detailRes.json();
-    if (listData.data?.length > 0) {
-      return { questflowId, companyId: listData.data[0].companyId || '' };
-    }
+    const data: any = await res.json();
+    return data.data?.[0]?.companyId || '';
+  } catch {
+    return '';
   }
+}
 
-  return { questflowId, companyId };
+async function createConversation(cookie: string): Promise<{ questflowId: string; companyId: string }> {
+  const baseUrl = process.env.QUESTFLOW_BASE_URL || 'https://next.questflow.ai';
+  try {
+    const res = await fetchWithRetry(`${baseUrl}/api/v6/copilot/conversations`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Cookie': cookie,
+        'Origin': 'https://next.questflow.ai',
+        'Referer': 'https://next.questflow.ai/',
+        'User-Agent': 'Mozilla/5.0',
+      },
+      body: JSON.stringify({ title: 'API Chat' }),
+    });
+
+    if (res.ok) {
+      let text = '';
+      try { text = await res.text(); } catch { /* body already consumed */ }
+      if (text) {
+        const data = JSON.parse(text);
+        const questflowId = data.data?._id || data._id;
+        const companyId = data.data?.companyId || process.env.QUESTFLOW_COMPANY_ID || '';
+        if (questflowId) return { questflowId, companyId };
+      }
+    }
+    throw new Error(`Create conversation returned ${res.status}`);
+  } catch (err: any) {
+    logger.warn('Failed to create conversation, falling back to existing:', err.message);
+    throw err;
+  }
+}
+
+async function getExistingConversation(cookie: string): Promise<{ questflowId: string; companyId: string } | null> {
+  try {
+    const baseUrl = process.env.QUESTFLOW_BASE_URL || 'https://next.questflow.ai';
+    const res = await fetchWithRetry(`${baseUrl}/api/v6/copilot/conversations`, {
+      headers: { 'Cookie': cookie, 'User-Agent': 'Mozilla/5.0' },
+    });
+    const text = await res.text();
+    if (!text) return null;
+    const data = JSON.parse(text);
+    if (data.data?.length > 0) {
+      return {
+        questflowId: data.data[0]._id,
+        companyId: data.data[0].companyId || process.env.QUESTFLOW_COMPANY_ID || '',
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 async function getOrCreateConversation(
   conversationId: string | undefined,
   cookie: string
 ): Promise<{ questflowId: string; companyId: string }> {
-  // 如果客户端传了 conversation_id，从缓存查找
   if (conversationId && conversationCache.has(conversationId)) {
     return conversationCache.get(conversationId)!;
   }
 
-  // 创建新会话
-  const conv = await createConversation(cookie);
-
-  // 用 OpenAI 的 conversation_id（或生成一个新的）作为 key
-  const key = conversationId || `qf-${uuidv4()}`;
-  conversationCache.set(key, conv);
-
-  return conv;
+  // 尝试创建新对话
+  try {
+    const conv = await createConversation(cookie);
+    const key = conversationId || `qf-${uuidv4()}`;
+    conversationCache.set(key, conv);
+    return conv;
+  } catch {
+    // 创建失败，尝试复用已有对话
+    const existing = await getExistingConversation(cookie);
+    if (existing) {
+      logger.info('Using existing conversation:', existing.questflowId);
+      const key = conversationId || `qf-${uuidv4()}`;
+      conversationCache.set(key, existing);
+      return existing;
+    }
+    // 最后兜底：用 env 中的 companyId
+    const companyId = await getCompanyId(cookie);
+    throw new Error('Cannot create or find any conversation. Please ensure cookies are valid.');
+  }
 }
 
 function buildQuestflowBody(
