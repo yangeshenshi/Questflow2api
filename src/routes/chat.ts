@@ -1,5 +1,6 @@
 import { Request, Response, Router } from 'express';
 import fetch from 'node-fetch';
+import https from 'https';
 import { v4 as uuidv4 } from 'uuid';
 import { OpenAIChatRequest } from '../types/openai';
 import {
@@ -14,8 +15,35 @@ import { logger } from '../utils/logger';
 
 const router = Router();
 
+// HTTP Agent for connection reuse
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  timeout: 30000,
+});
+
 // 会话缓存：OpenAI conversation_id -> Questflow conversationId + companyId
 const conversationCache = new Map<string, { questflowId: string; companyId: string }>();
+
+/**
+ * fetch 带重试逻辑，处理 Premature close 等网络抖动
+ */
+async function fetchWithRetry(url: string, options: any, retries = 2): Promise<any> {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const res = await fetch(url, { ...options, agent: httpsAgent });
+      return res;
+    } catch (err: any) {
+      if (i === retries) throw err;
+      if (err.type === 'system' || err.message?.includes('Premature close')) {
+        logger.warn(`Fetch retry ${i + 1}/${retries}: ${url} - ${err.message}`);
+        await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
 
 function getQuestflowHeaders(): Record<string, string> {
   const authType = process.env.QUESTFLOW_AUTH_TYPE || 'cookie';
@@ -49,7 +77,7 @@ function getQuestflowHeaders(): Record<string, string> {
 
 async function createConversation(cookie: string): Promise<{ questflowId: string; companyId: string }> {
   const baseUrl = process.env.QUESTFLOW_BASE_URL || 'https://next.questflow.ai';
-  const res = await fetch(`${baseUrl}/api/v6/copilot/conversations`, {
+  const res = await fetchWithRetry(`${baseUrl}/api/v6/copilot/conversations`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -70,7 +98,7 @@ async function createConversation(cookie: string): Promise<{ questflowId: string
   const companyId = data.data?.companyId || process.env.QUESTFLOW_COMPANY_ID || '';
 
   if (!companyId) {
-    const detailRes = await fetch(`${baseUrl}/api/v6/copilot/conversations`, {
+    const detailRes = await fetchWithRetry(`${baseUrl}/api/v6/copilot/conversations`, {
       headers: { 'Cookie': cookie, 'User-Agent': 'Mozilla/5.0' },
     });
     const listData: any = await detailRes.json();
@@ -148,6 +176,7 @@ router.post('/completions', async (req: Request, res: Response) => {
       headers,
       body: JSON.stringify(body),
       signal: controller.signal as any,
+      agent: httpsAgent,
     });
 
     clearTimeout(timeout);
